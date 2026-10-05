@@ -1,0 +1,12 @@
+# TIA Portal working folders (share the .zap20 archive instead)
+*.ap20
+IM/
+Logs/
+System/
+TMP/
+UserFiles/
+XRef/
+AdditionalFiles/
+Vci/
+*.bak
+Thumbs.db

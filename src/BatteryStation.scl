@@ -1,0 +1,346 @@
+// =====================================================================
+// Battery Module Assembly Station - simulated maintenance demo
+// Siemens TIA Portal V20, S7-1500, SCL
+// Blocks: FB_Device (reusable, used twice), FB_PlantSim, FB_Station,
+//         DB "HMI", instance DBs, FC_Main (called from OB1)
+// =====================================================================
+
+// ---------------------------------------------------------------------
+// FB_Device: ONE standard block for any device that is switched ON and
+// must confirm with a sensor (motor, valve, clamp...).
+// - switches the output only when allowed
+// - raises a FAULT if the sensor does not confirm in time (timeout)
+// - counts starts and running seconds (data for preventive maintenance)
+// ---------------------------------------------------------------------
+FUNCTION_BLOCK "FB_Device"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+   VAR_INPUT
+      Cmd : Bool;                 // sequence wants the device ON
+      Feedback : Bool;            // sensor confirms the device did its job
+      Timeout : Time := T#5S;     // max time allowed to get the feedback
+      ResetCmd : Bool;            // operator reset of the fault
+      Enable : Bool;              // FALSE = interlock (e.g. emergency stop)
+   END_VAR
+   VAR_OUTPUT
+      Q : Bool;                   // drive output (contactor / valve)
+      Fault : Bool;               // timeout fault, stays ON until reset
+   END_VAR
+   VAR
+      Operations : DInt;          // number of starts (maintenance data)
+      OperatingTime_s : DInt;     // total ON time in seconds (maintenance data)
+      tonTimeout : TON_TIME;
+      tonSecond : TON_TIME;
+      qOld : Bool;
+   END_VAR
+
+BEGIN
+   // 1) Output ON only if commanded, enabled and not faulted
+   #Q := #Cmd AND #Enable AND NOT #Fault;
+
+   // 2) Count starts (rising edge of the output)
+   IF #Q AND NOT #qOld THEN
+      #Operations := #Operations + 1;
+   END_IF;
+   #qOld := #Q;
+
+   // 3) Timeout supervision: ON but no feedback within Timeout -> fault
+   #tonTimeout(IN := #Q AND NOT #Feedback,
+               PT := #Timeout);
+   IF #tonTimeout.Q THEN
+      #Fault := TRUE;
+   END_IF;
+
+   // 4) Reset clears the fault
+   IF #ResetCmd THEN
+      #Fault := FALSE;
+   END_IF;
+
+   // 5) Running-time counter: +1 every second while ON
+   #tonSecond(IN := #Q AND NOT #tonSecond.Q,
+              PT := T#1S);
+   IF #tonSecond.Q THEN
+      #OperatingTime_s := #OperatingTime_s + 1;
+   END_IF;
+END_FUNCTION_BLOCK
+
+
+// ---------------------------------------------------------------------
+// FB_PlantSim: a FAKE machine, so we can test without hardware.
+// It reacts to the PLC outputs and creates the sensor signals.
+// Two switches inject faults on purpose to test the alarms.
+// ---------------------------------------------------------------------
+FUNCTION_BLOCK "FB_PlantSim"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+   VAR_INPUT
+      ConveyorOn : Bool;
+      ClampOn : Bool;
+      SimJam : Bool;              // TRUE = module stuck, never arrives
+      SimSensorFault : Bool;      // TRUE = clamp sensor broken
+   END_VAR
+   VAR_OUTPUT
+      B1_ModuleAtStation : Bool;
+      B2_ClampClosed : Bool;
+   END_VAR
+   VAR
+      partAtStation : Bool;
+      tonArrive : TON_TIME;
+      tonLeave : TON_TIME;
+      tonClamp : TON_TIME;
+   END_VAR
+
+BEGIN
+   // Module travels 3 s on the conveyor until it reaches the station
+   #tonArrive(IN := #ConveyorOn AND NOT #partAtStation AND NOT #SimJam,
+              PT := T#3S);
+   IF #tonArrive.Q THEN
+      #partAtStation := TRUE;
+   END_IF;
+
+   // Module leaves the station 1.5 s after the conveyor restarts
+   #tonLeave(IN := #ConveyorOn AND #partAtStation AND NOT #ClampOn,
+             PT := T#1500MS);
+   IF #tonLeave.Q THEN
+      #partAtStation := FALSE;
+   END_IF;
+
+   // Clamp needs 0.8 s to close
+   #tonClamp(IN := #ClampOn AND NOT #SimSensorFault,
+             PT := T#800MS);
+
+   #B1_ModuleAtStation := #partAtStation;
+   #B2_ClampClosed := #tonClamp.Q;
+END_FUNCTION_BLOCK
+
+
+// ---------------------------------------------------------------------
+// FB_Station: the station logic
+// Step 0 idle -> 10 transport in -> 20 clamp -> 30 process 2 s
+//        -> 40 release + transport out -> back to 10
+// ---------------------------------------------------------------------
+FUNCTION_BLOCK "FB_Station"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+   VAR_INPUT
+      StartCmd : Bool;
+      StopCmd : Bool;
+      ResetCmd : Bool;
+      EStopOK : Bool;             // TRUE = emergency stop NOT pressed
+      B1_ModuleAtStation : Bool;
+      B2_ClampClosed : Bool;
+      ServiceDone : Bool;         // technician confirms the service was done
+   END_VAR
+   VAR_OUTPUT
+      M1_Conveyor : Bool;
+      Y1_Clamp : Bool;
+      H1_Running : Bool;
+      H2_Fault : Bool;
+      H3_MaintenanceDue : Bool;
+      AlarmWord : Word;           // bit0 E-stop, bit1 conveyor timeout, bit2 clamp timeout, bit3 maintenance due
+   END_VAR
+   VAR
+      Step : Int;                 // current step of the sequence
+      Running : Bool;
+      EStopFault : Bool;
+      Conveyor : "FB_Device";     // same standard block...
+      Clamp : "FB_Device";        // ...used twice
+      tonProcess : TON_TIME;
+      tonCycle : TON_TIME;
+      cycleDone : Bool;
+      LastCycleTime : Time;
+      CyclesTotal : DInt;
+      CyclesSinceService : DInt;
+      ServiceInterval : DInt := 20;   // demo value: service every 20 cycles
+   END_VAR
+   VAR_TEMP
+      anyFault : Bool;
+      convCmd : Bool;
+      clampCmd : Bool;
+   END_VAR
+
+BEGIN
+   // --- 1. Emergency stop: latched until Reset with the E-stop released
+   IF NOT #EStopOK THEN
+      #EStopFault := TRUE;
+   ELSIF #ResetCmd THEN
+      #EStopFault := FALSE;
+   END_IF;
+
+   #anyFault := #EStopFault OR #Conveyor.Fault OR #Clamp.Fault;
+
+   // --- 2. Run latch (start/stop "seal-in"). Stop and faults win over Start.
+   IF #StopCmd OR #anyFault THEN
+      #Running := FALSE;
+   ELSIF #StartCmd THEN
+      #Running := TRUE;
+   END_IF;
+
+   IF NOT #Running THEN
+      #Step := 0;
+   END_IF;
+
+   // --- 3. Sequence (step chain)
+   #tonProcess(IN := (#Step = 30),
+               PT := T#2S);
+   #cycleDone := FALSE;
+
+   CASE #Step OF
+      0:  // Idle
+         IF #Running THEN
+            #Step := 10;
+         END_IF;
+      10: // Transport module in
+         IF #B1_ModuleAtStation THEN
+            #Step := 20;
+         END_IF;
+      20: // Close clamp
+         IF #B2_ClampClosed THEN
+            #Step := 30;
+         END_IF;
+      30: // Process (e.g. pressing / screwing) for 2 s
+         IF #tonProcess.Q THEN
+            #Step := 40;
+         END_IF;
+      40: // Open clamp, transport module out
+         IF NOT #B1_ModuleAtStation AND NOT #B2_ClampClosed THEN
+            #cycleDone := TRUE;
+            #Step := 10;
+         END_IF;
+   END_CASE;
+
+   // --- 4. Devices (same block, two instances)
+   #convCmd := (#Step = 10) OR ((#Step = 40) AND NOT #B2_ClampClosed);
+   #clampCmd := (#Step = 20) OR (#Step = 30);
+
+   #Conveyor(Cmd := #convCmd,
+             Feedback := ((#Step = 10) AND #B1_ModuleAtStation) OR ((#Step = 40) AND NOT #B1_ModuleAtStation),
+             Timeout := T#8S,
+             ResetCmd := #ResetCmd,
+             Enable := NOT #EStopFault);
+
+   #Clamp(Cmd := #clampCmd,
+          Feedback := #B2_ClampClosed,
+          Timeout := T#3S,
+          ResetCmd := #ResetCmd,
+          Enable := NOT #EStopFault);
+
+   // --- 5. Cycle time and counters
+   IF #cycleDone THEN
+      #LastCycleTime := #tonCycle.ET;
+      #CyclesTotal := #CyclesTotal + 1;
+      #CyclesSinceService := #CyclesSinceService + 1;
+   END_IF;
+   #tonCycle(IN := (#Step <> 0) AND NOT #cycleDone,
+             PT := T#1H);
+
+   // --- 6. Preventive maintenance
+   IF #ServiceDone THEN
+      #CyclesSinceService := 0;
+   END_IF;
+   #H3_MaintenanceDue := #CyclesSinceService >= #ServiceInterval;
+
+   // --- 7. Outputs and alarms
+   #M1_Conveyor := #Conveyor.Q;
+   #Y1_Clamp := #Clamp.Q;
+   #H1_Running := #Running;
+   #H2_Fault := #anyFault;
+
+   #AlarmWord := W#16#0;
+   #AlarmWord.%X0 := #EStopFault;
+   #AlarmWord.%X1 := #Conveyor.Fault;
+   #AlarmWord.%X2 := #Clamp.Fault;
+   #AlarmWord.%X3 := #H3_MaintenanceDue;
+END_FUNCTION_BLOCK
+
+
+// ---------------------------------------------------------------------
+// DB "HMI": everything the operator screen reads and writes
+// ---------------------------------------------------------------------
+DATA_BLOCK "HMI"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+NON_RETAIN
+   VAR
+      StartBtn : Bool;            // HMI buttons (ON while pressed)
+      StopBtn : Bool;
+      ResetBtn : Bool;
+      EStopBtn : Bool;            // simulated emergency stop (TRUE = pressed)
+      ServiceDoneBtn : Bool;
+      SimMode : Bool := TRUE;     // TRUE = use the fake machine
+      SimJam : Bool;              // fault injection
+      SimSensorFault : Bool;      // fault injection
+      AlarmWord : Word;           // copied from the station for HMI alarms
+   END_VAR
+
+BEGIN
+
+END_DATA_BLOCK
+
+
+DATA_BLOCK "Station_DB"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+NON_RETAIN
+"FB_Station"
+
+BEGIN
+
+END_DATA_BLOCK
+
+
+DATA_BLOCK "PlantSim_DB"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+NON_RETAIN
+"FB_PlantSim"
+
+BEGIN
+
+END_DATA_BLOCK
+
+
+// ---------------------------------------------------------------------
+// FC_Main: wiring. Chooses real or simulated sensors, calls the blocks.
+// Called from OB1 (Main).
+// ---------------------------------------------------------------------
+FUNCTION "FC_Main" : Void
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+   VAR_TEMP
+      b1 : Bool;
+      b2 : Bool;
+      estopOK : Bool;
+   END_VAR
+
+BEGIN
+   // Sensors: from the fake machine (simulation) or from real inputs
+   IF "HMI".SimMode THEN
+      #b1 := "PlantSim_DB".B1_ModuleAtStation;
+      #b2 := "PlantSim_DB".B2_ClampClosed;
+      #estopOK := NOT "HMI".EStopBtn;
+   ELSE
+      #b1 := "B1_ModuleAtStation";
+      #b2 := "B2_ClampClosed";
+      #estopOK := "EStop_OK";
+   END_IF;
+
+   "Station_DB"(StartCmd := "PB_Start" OR "HMI".StartBtn,
+                StopCmd := "PB_Stop" OR "HMI".StopBtn,
+                ResetCmd := "PB_Reset" OR "HMI".ResetBtn,
+                EStopOK := #estopOK,
+                B1_ModuleAtStation := #b1,
+                B2_ClampClosed := #b2,
+                ServiceDone := "HMI".ServiceDoneBtn,
+                M1_Conveyor => "M1_Conveyor",
+                Y1_Clamp => "Y1_Clamp",
+                H1_Running => "H1_Running",
+                H2_Fault => "H2_Fault",
+                H3_MaintenanceDue => "H3_MaintenanceDue",
+                AlarmWord => "HMI".AlarmWord);
+
+   "PlantSim_DB"(ConveyorOn := "M1_Conveyor",
+                 ClampOn := "Y1_Clamp",
+                 SimJam := "HMI".SimJam,
+                 SimSensorFault := "HMI".SimSensorFault);
+END_FUNCTION
